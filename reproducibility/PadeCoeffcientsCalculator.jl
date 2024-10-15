@@ -1,11 +1,11 @@
 using LsqFit, Roots, Plots, Combinatorics, QuadGK, SpecialFunctions
-using BlackBoxOptim, LinearAlgebra
+using BlackBoxOptim, LinearAlgebra, ForwardDiff
 
-const Δ = 1e8eps()
+const Δ = sqrt(eps())
 
 function invf(f, x)
  return try
-     Roots.find_zero(y->f(y) - x, 0.5)
+   Roots.find_zero(y->f(y) - x, 0.5)
  catch
    @warn "Retrying root find with $x"
    Roots.find_zero(y->f(y) - x, 0.5, Secant())
@@ -24,8 +24,6 @@ function padeab(p)
 end
 
 function pade(x::T, p, transformop::F)::T where {T,F}
-#  x = sqrt(-log(sqrt(1-x))) # tan(x * π/2) #
-#  x = cbrt(-log((1-x))) # tan(x * π/2) #
   x = transformop(x)
   as, bs = padeab(p)
   num = evalpoly(x, as) * x #sum(as[i] * x^i for i in eachindex(as))
@@ -34,12 +32,12 @@ function pade(x::T, p, transformop::F)::T where {T,F}
   return T(num / denom)
 end
 
-pades(x::Number, p, ncoeffs, transformop::F) where F = pade(x, p, transformop)
+pades(x::Number, p, transformop::F) where F = pade(x, p, transformop)
 
-pades(x, p, ncoeff, transformop::F) where F = [pades(xi, p, ncoeff, transformop) for xi in x]
+pades(x, p, transformop::F) where F = [pades(xi, p, transformop) for xi in x]
 
 function quadratureobjective(p, ncoeff, f::F, transformop::G; rtol=1e-12) where {F,G}
-  return quadgk(x->abs(pades(x, p, ncoeff, transformop) - invf(f, x)), 0, 1-Δ, rtol=rtol)[1]
+  return quadgk(x->abs(pades(x, p, transformop) - invf(f, x)), 0, 1-Δ, rtol=rtol)[1]
 end
 
 function quadratureoptimisation(objective::F, ncoeff, guess, transformop::G; timelimitperncoeff=10) where {F,G}
@@ -53,20 +51,20 @@ function quadratureoptimisation(objective::F, ncoeff, guess, transformop::G; tim
   coeffs = best_candidate(res)
   fitness = best_fitness(res)
   @show fitness, coeffs
-  return x->pades(x, coeffs, ncoeff, transformop), coeffs
+  return x->pades(x, coeffs, transformop), coeffs
 end
 
 function discretefit(objective::F, ncoeff, transformop::G, c = collect(1/200:1/100:1-1/200)) where {F,G}
   function m(x, p)
     @assert length(p) == ncoeff
-    return pades(x, p, ncoeff, transformop)
+    return pades(x, p, transformop)
   end
   fit = curve_fit(m, c, invf.(objective, c), ones(ncoeff))
   return x->m(x, fit.param), fit.param
 end
 
 function calculatefit(f::F, fname, transformop::G;
-    N=1000, ncoeffs=(8, 12, 16), timelimitperncoeff=10) where {F, G}
+    N=1000, ncoeffs=(12,), timelimitperncoeff=10) where {F, G}
   ncoeffs = collect(ncoeffs)
   c = collect(1/2N:1/N:1 - 1/N/2)
   y = invf.(f, c)
@@ -84,12 +82,6 @@ function calculatefit(f::F, fname, transformop::G;
       @assert fit(1 - eps()) > 0
       @assert all(z .> 0)
       err, errerr = QuadGK.quadgk(x->abs(fit(x) - invf(f, x)), 0, 1 - Δ)
-  #    gradf = ForwardDiff.gradient(x->quadratureobjective(x, ncoeff, f, transformop), param)
-  #    hessf = Calculus.hessian(x->quadratureobjective(x, ncoeff, f, transformop), param)
-  #    mse = quadratureobjective(param, ncoeff, f, transformop, rtol=1e-4)
-  #    paramwitherrors = measurement.(param, sqrt.(mse * abs.(diag(inv(hessf)))))
-  #    paramwitherrors = measurement.(param, param .* eps() ./ gradf)
-      #@show paramwitherrors
       d[ncoeff] = (param, err, fit, )#paramwitherrors)
       Plots.plot!(h, c, z .- y, label="$ncoeff, $err")
     catch err
@@ -113,7 +105,7 @@ function calculatefit(f::F, fname, transformop::G;
     end
 
     savefig(h, fname * ".pdf")
-    return (h, d)
+    return coeffs
   catch err
     @show err
     return nothing
@@ -135,16 +127,61 @@ lamberttransformop(x) = sqrt(-1 - lambertw((x - 1) / exp(1), -1))
 othertransform(x) = sqrt(-log(1-sqrt(x)))
 quarterroot(x) = sqrt(sqrt(-log(1-x)))
 
-tlim=30
-#h = calculatefit(funi, "Uniform_v cbrttransformop", cbrttransformop; timelimitperncoeff=tlim)
-#h = calculatefit(fv, "Wedge_v cbrttransformop", cbrttransformop; timelimitperncoeff=tlim)
-h = calculatefit(fv, "Wedge_v quarterroot", quarterroot; timelimitperncoeff=tlim)
-#h = calculatefit(fv, "Wedge_v othertransform", othertransform; timelimitperncoeff=tlim)
-#h = calculatefit(fvx, "Wedge_vx defaulttransformop", defaulttransformop; timelimitperncoeff=tlim)
-#h = calculatefit(fvx, "Wedge_vx vxtransformop", vxtransformop; timelimitperncoeff=tlim)
-#h = calculatefit(fvx, "Wedge_vx cbrttransformop", cbrttransformop; timelimitperncoeff=tlim)
-#h = calculatefit(fv⊥, "Wedge_vperp defaulttransformop", defaulttransformop; timelimitperncoeff=tlim)
+
+function calctransform(obj::O; rtol=1e-12) where {O}
+  fit3(x, p) = p[3] * (-log(1-x^p[1]))^p[2]
+  res = bboptimize(p->quadgk(x->abs(fit3(x, p) - invf(obj, x)), 0, 1-Δ, rtol=rtol)[1],
+    SearchRange=(0.0, 2.0), NumDimensions=3,
+    MaxSteps=1000000000, TraceInterval=10, MaxTime=40,
+    Method=:adaptive_de_rand_1_bin_radiuslimited,)# TraceMode=:silent)#:adaptive_de_rand_1_bin
+  coeffs = best_candidate(res)
+  fitness = best_fitness(res)
+  @show coeffs, fitness
+  coeffs12 = [coeffs[1:2]..., 1.0]
+  return (x->fit3(x, coeffs12), coeffs, fitness)
+end
+
+function newtonstepper(x, guess, obj, nsteps=1)
+  truth = invf(obj, x)
+  y = guess(x)
+  for i in 1:nsteps
+    y = y - (obj(y) - x) / ForwardDiff.derivative(obj, y)
+  end
+  return y
+end
+
+# #tlim=10
+# #h = calculatefit(funi, "Uniform_v custom", calctransform(funi)[1]; timelimitperncoeff=tlim)
+# #h = calculatefit(fv, "Wedge_v custom", calctransform(fv)[1]; timelimitperncoeff=tlim)
+# #h = calculatefit(fvx, "Wedge_vx custom", calctransform(fvx)[1]; timelimitperncoeff=tlim)
+# #h = calculatefit(fv⊥, "Wedge_vperp custom", calctransform(fvx⊥)[1]; timelimitperncoeff=tlim)
+tlim=20
+# coeffs = calculatefit(funi, "Uniform_v cbrttransformop", cbrttransformop; timelimitperncoeff=tlim)
+# foo(z, n) = newtonstepper(z, x -> pades(x, coeffs, cbrttransformop), funi, n)
+# @show quadgk(x->abs(foo(x, 0) - invf(funi, x)), Δ, 1-Δ, rtol=1e-12)[1]
+# @show quadgk(x->abs(foo(x, 1) - invf(funi, x)), Δ, 1-Δ, rtol=1e-12)[1]
+# @show quadgk(x->abs(foo(x, 2) - invf(funi, x)), Δ, 1-Δ, rtol=1e-12)[1]
+# #h = calculatefit(fv, "Wedge_v cbrttransformop", cbrttransformop; timelimitperncoeff=tlim)
+# #
+# coeffs = calculatefit(fv, "Wedge_v quarterroot", quarterroot; timelimitperncoeff=tlim)
+# foo(z, n) = newtonstepper(z, x -> pades(x, coeffs, quarterroot), fv, n)
+# @show quadgk(x->abs(foo(x, 0) - invf(fv, x)), Δ, 1-Δ, rtol=1e-12)[1]
+# @show quadgk(x->abs(foo(x, 1) - invf(fv, x)), Δ, 1-Δ, rtol=1e-12)[1]
+# @show quadgk(x->abs(foo(x, 2) - invf(fv, x)), Δ, 1-Δ, rtol=1e-12)[1]
+# # 
+# # #h = calculatefit(fv, "Wedge_v othertransform", othertransform; timelimitperncoeff=tlim)
+# # #h = calculatefit(fvx, "Wedge_vx defaulttransformop", defaulttransformop; timelimitperncoeff=tlim)
+# # #h = calculatefit(fvx, "Wedge_vx vxtransformop", vxtransformop; timelimitperncoeff=tlim)
+# coeffs = calculatefit(fvx, "Wedge_vx cbrttransformop", cbrttransformop; timelimitperncoeff=2tlim)
+# foo(z, n) = newtonstepper(z, x -> pades(x, coeffs, cbrttransformop), fvx, n)
+# @show quadgk(x->abs(foo(x, 0) - invf(fvx, x)), Δ, 1-Δ, rtol=1e-12)[1]
+# @show quadgk(x->abs(foo(x, 1) - invf(fvx, x)), Δ, 1-Δ, rtol=1e-12)[1]
+# @show quadgk(x->abs(foo(x, 2) - invf(fvx, x)), Δ, 1-Δ, rtol=1e-12)[1]
+
+coeffs = calculatefit(fv⊥, "Wedge_vperp defaulttransformop", defaulttransformop; timelimitperncoeff=2tlim)
+foo(z, n) = newtonstepper(z, x -> pades(x, coeffs, defaulttransformop), fv⊥, n)
+@show quadgk(x->abs(foo(x, 0) - invf(fv⊥, x)), Δ, 1-Δ, rtol=1e-12)[1]
+@show quadgk(x->abs(foo(x, 1) - invf(fv⊥, x)), Δ, 1-Δ, rtol=1e-12)[1]
+@show quadgk(x->abs(foo(x, 2) - invf(fv⊥, x)), Δ, 1-Δ, rtol=1e-12)[1]
 #h = calculatefit(fv⊥, "Wedge_vperp cbrttransformop", cbrttransformop; timelimitperncoeff=tlim)
-
-
 
